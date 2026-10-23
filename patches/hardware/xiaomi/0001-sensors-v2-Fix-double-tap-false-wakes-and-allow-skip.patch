@@ -1,0 +1,136 @@
+From 1ec8531d720142a4d4912ce22a98bd2046ddee74 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 22 Oct 2026 21:04:02 -0300
+Subject: [PATCH] sensors: v2: Fix double tap false wakes and allow skipping
+ its enable node
+
+The double tap state node of the Xiaomi touch driver always reads 1, so
+any POLLPRI on it is taken as a gesture. sysfs keeps reporting POLLPRI on
+an attribute that was opened but never read, so the first poll() after
+boot returned immediately and woke the device about 50ms after the first
+doze. Read the node once after opening it, and again whenever the sensor
+is enabled, so only notifications that arrive while it is listening count.
+
+Some devices arm the gesture in the touch IC through TouchFeature, and the
+sensor writing 0 to gesture_double_tap_enabled when it fires or is
+disabled races with that and leaves the gesture off. Add
+DOUBLE_TAP_SENSOR_SKIP_ENABLE so those devices can make the sensor only
+listen for the event.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01Kye574qt5dotSwvkUkvhEe
+---
+ sensors/v2/Android.bp | 10 +++++++++-
+ sensors/v2/Sensor.cpp | 18 ++++++++++++++++++
+ sensors/v2/Sensor.h   | 10 +++++++++-
+ 3 files changed, 36 insertions(+), 2 deletions(-)
+
+diff --git a/sensors/v2/Android.bp b/sensors/v2/Android.bp
+index a5de497..c31fe4f 100644
+--- a/sensors/v2/Android.bp
++++ b/sensors/v2/Android.bp
+@@ -8,7 +8,12 @@ soong_config_module_type {
+     name: "sensors_xiaomi_cc_defaults",
+     module_type: "cc_defaults",
+     config_namespace: "SENSORS_XIAOMI",
+-    bool_variables: ["USES_UDFPS_SENSOR", "USES_DOUBLE_TAP_SENSOR", "USES_SINGLE_TAP_SENSOR"],
++    bool_variables: [
++        "USES_UDFPS_SENSOR",
++        "USES_DOUBLE_TAP_SENSOR",
++        "DOUBLE_TAP_SENSOR_SKIP_ENABLE",
++        "USES_SINGLE_TAP_SENSOR",
++    ],
+     properties: ["cppflags"],
+ }
+ 
+@@ -21,6 +26,9 @@ sensors_xiaomi_cc_defaults {
+         USES_DOUBLE_TAP_SENSOR: {
+             cppflags: ["-DUSES_DOUBLE_TAP_SENSOR"],
+         },
++        DOUBLE_TAP_SENSOR_SKIP_ENABLE: {
++            cppflags: ["-DDOUBLE_TAP_SENSOR_SKIP_ENABLE"],
++        },
+         USES_SINGLE_TAP_SENSOR: {
+             cppflags: ["-DUSES_SINGLE_TAP_SENSOR"],
+         },
+diff --git a/sensors/v2/Sensor.cpp b/sensors/v2/Sensor.cpp
+index 6692a0d..0a0cac6 100644
+--- a/sensors/v2/Sensor.cpp
++++ b/sensors/v2/Sensor.cpp
+@@ -16,6 +16,7 @@
+ 
+ #include "Sensor.h"
+ 
++#include <errno.h>
+ #include <hardware/sensors.h>
+ #include <log/log.h>
+ #include <utils/SystemClock.h>
+@@ -242,6 +243,11 @@ SysfsPollingOneShotSensor::SysfsPollingOneShotSensor(
+     mPollFd = open(pollPath.c_str(), O_RDONLY);
+     if (mPollFd < 0) {
+         ALOGE("failed to open poll fd: %d", mPollFd);
++    } else {
++        // sysfs reports POLLPRI on a freshly opened attribute until it has been
++        // read once, so the first poll() would return straight away and post a
++        // bogus event. Read it now to start from a clean state.
++        clearPendingEvent();
+     }
+ 
+     if (mWaitPipeFd[0] < 0 || mWaitPipeFd[1] < 0 || mPollFd < 0) {
+@@ -283,6 +289,9 @@ void SysfsPollingOneShotSensor::activate(bool enable, bool notify, bool lock) {
+     }
+ 
+     if (mIsEnabled != enable) {
++        // Drop notifications that arrived while the sensor was off, so enabling it
++        // doesn't fire on a stale gesture.
++        if (enable) clearPendingEvent();
+ 
+         writeEnable(enable);
+ 
+@@ -338,6 +347,15 @@ void SysfsPollingOneShotSensor::run() {
+     }
+ }
+ 
++void SysfsPollingOneShotSensor::clearPendingEvent() {
++    if (mPollFd < 0) return;
++
++    char buf[16];
++    if (lseek(mPollFd, 0, SEEK_SET) != 0 || read(mPollFd, buf, sizeof(buf)) < 0) {
++        ALOGE("failed to clear pending event: %d", errno);
++    }
++}
++
+ void SysfsPollingOneShotSensor::interruptPoll() {
+     if (mWaitPipeFd[1] < 0) return;
+ 
+diff --git a/sensors/v2/Sensor.h b/sensors/v2/Sensor.h
+index 11b63d1..068bd2d 100644
+--- a/sensors/v2/Sensor.h
++++ b/sensors/v2/Sensor.h
+@@ -120,6 +120,7 @@ class SysfsPollingOneShotSensor : public OneShotSensor {
+     std::ofstream mEnableStream;
+ 
+   private:
++    void clearPendingEvent();
+     void interruptPoll();
+ 
+     struct pollfd mPolls[2];
+@@ -167,7 +168,14 @@ class DoubleTapSensor : public SysfsPollingOneShotSensor {
+     DoubleTapSensor(int32_t sensorHandle, ISensorsEventCallback* callback)
+         : SysfsPollingOneShotSensor(
+               sensorHandle, callback, GetPollPath(doubleTapPaths),
+-              GetPollPath(doubleTapPathsEnable), "Double Tap Sensor", "co.aospa.sensor.double_tap",
++#ifdef DOUBLE_TAP_SENSOR_SKIP_ENABLE
++              // The gesture is armed elsewhere (e.g. through TouchFeature), so only
++              // listen for the event and never write the enable node.
++              "",
++#else
++              GetPollPath(doubleTapPathsEnable),
++#endif
++              "Double Tap Sensor", "co.aospa.sensor.double_tap",
+               static_cast<SensorType>(static_cast<int32_t>(SensorType::DEVICE_PRIVATE_BASE) + 3)) {}
+ };
+ #endif
+-- 
+2.43.0
+
